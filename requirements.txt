@@ -1,5 +1,6 @@
 streamlit>=1.35.0
 reportlab>=4.0
+pandas>=2.0
 
 # Note: Claude API calls use Python's stdlib urllib (no anthropic SDK needed).
 # If you prefer the SDK, add: anthropic>=0.25.0
