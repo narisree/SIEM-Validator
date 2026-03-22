@@ -55,6 +55,19 @@ st.markdown("""
     }
     .ai-assessment-header { font-weight: 600; color: #0369a1; margin-bottom: 0.5rem; }
 
+    .provider-badge {
+        display: inline-block;
+        padding: 0.15rem 0.6rem;
+        border-radius: 20px;
+        font-size: 0.72rem;
+        font-weight: 600;
+        margin-left: 0.4rem;
+        vertical-align: middle;
+    }
+    .provider-claude   { background: #f0e7ff; color: #6b21a8; }
+    .provider-groq     { background: #fef9c3; color: #854d0e; }
+    .provider-free     { background: #dcfce7; color: #166534; }
+
     .cp-card {
         background: #f8fafc;
         border: 1px solid #e2e8f0;
@@ -159,6 +172,43 @@ SIEM_LABELS = {
     "unknown":   "Unknown",
 }
 
+# =====================================================
+# AI PROVIDER CONFIG
+# =====================================================
+
+AI_PROVIDERS = {
+    "claude": {
+        "label":    "Claude Sonnet 4.6 (Anthropic)",
+        "model":    "claude-sonnet-4-6",
+        "free":     False,
+        "key_hint": "Starts with sk-ant-… — get one at console.anthropic.com",
+        "badge":    "provider-claude",
+        "badge_text": "Anthropic",
+    },
+    "groq_kimi": {
+        "label":    "Kimi K2 via Groq (Free tier)",
+        "model":    "moonshotai/kimi-k2-instruct",
+        "free":     True,
+        "key_hint": "Groq API key — free at console.groq.com (1,000 req/day)",
+        "badge":    "provider-groq",
+        "badge_text": "Groq · Free",
+    },
+    "groq_llama": {
+        "label":    "Llama 3.3 70B via Groq (Free tier)",
+        "model":    "llama-3.3-70b-versatile",
+        "free":     True,
+        "key_hint": "Groq API key — free at console.groq.com (1,000 req/day on 70B)",
+        "badge":    "provider-groq",
+        "badge_text": "Groq · Free",
+    },
+}
+
+PROVIDER_OPTIONS = {
+    "Claude Sonnet 4.6 (Anthropic — paid)":    "claude",
+    "Kimi K2 via Groq (Free tier)":            "groq_kimi",
+    "Llama 3.3 70B via Groq (Free tier)":      "groq_llama",
+}
+
 
 # =====================================================
 # SESSION STATE INITIALIZATION
@@ -168,6 +218,7 @@ def init_session_state():
     defaults = {
         "page":             "upload",
         "api_key":          "",
+        "provider":         "claude",
         "siem_type":        "unknown",
         "raw_df":           None,
         "normalized_df":    None,
@@ -227,14 +278,11 @@ def extract_thresholds(spl_query):
 
 
 # =====================================================
-# HELPER: CLAUDE AI VALIDATION
+# AI VALIDATION — MULTI-PROVIDER
 # =====================================================
 
-def validate_with_ai(checkpoint_id, context_data, api_key):
-    import urllib.request
-    import ssl
-
-    prompts = {
+def _build_prompts(context_data):
+    return {
         "cp2": (
             "You are a SIEM security analyst. Compare this use case objective with the detection query "
             "and determine if the rule is built correctly to achieve the objective.\n\n"
@@ -329,39 +377,85 @@ def validate_with_ai(checkpoint_id, context_data, api_key):
         ),
     }
 
+
+def _parse_ai_status(text):
+    text_upper = text.upper()
+    if "STATUS: PASS" in text_upper:
+        return "pass"
+    elif "STATUS: FAIL" in text_upper:
+        return "fail"
+    elif "NOT APPLICABLE" in text_upper:
+        return "pass"
+    return "review"
+
+
+def _call_claude(prompt, api_key, model):
+    import urllib.request, ssl
+    data = json.dumps({
+        "model": model,
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+        return result["content"][0]["text"]
+
+
+def _call_groq(prompt, api_key, model):
+    import urllib.request, ssl
+    data = json.dumps({
+        "model": model,
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + api_key,
+        }
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"]
+
+
+def validate_with_ai(checkpoint_id, context_data, api_key, provider="claude"):
+    prompts = _build_prompts(context_data)
     if checkpoint_id not in prompts:
         return None
 
-    try:
-        data = json.dumps({
-            "model": "claude-sonnet-4-5",
-            "max_tokens": 1000,
-            "messages": [{"role": "user", "content": prompts[checkpoint_id]}]
-        }).encode("utf-8")
+    cfg = AI_PROVIDERS.get(provider, AI_PROVIDERS["claude"])
+    prompt = prompts[checkpoint_id]
 
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            }
-        )
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            text = result["content"][0]["text"]
-            status = "review"
-            if "STATUS: PASS" in text.upper():
-                status = "pass"
-            elif "STATUS: FAIL" in text.upper():
-                status = "fail"
-            elif "NOT APPLICABLE" in text.upper():
-                status = "pass"
-            return {"status": status, "assessment": text}
+    try:
+        if provider == "claude":
+            text = _call_claude(prompt, api_key, cfg["model"])
+        else:
+            # groq_kimi or groq_llama both use the Groq OpenAI-compatible endpoint
+            text = _call_groq(prompt, api_key, cfg["model"])
+
+        return {"status": _parse_ai_status(text), "assessment": text}
     except Exception as e:
-        return {"status": "review", "assessment": f"AI validation could not be completed: {str(e)}. Please review manually."}
+        return {
+            "status": "review",
+            "assessment": (
+                f"AI validation could not be completed ({cfg['label']}): {str(e)}. "
+                "Please review manually."
+            ),
+        }
 
 
 # =====================================================
@@ -530,7 +624,7 @@ def run_cp9(norm):
     }
 
 
-def run_ai_checkpoints(norm, siem_type, api_key):
+def run_ai_checkpoints(norm, siem_type, api_key, provider="claude"):
     results = {}
     if not api_key or not api_key.strip():
         for cp in ("cp2", "cp4", "cp5", "cp6", "cp7", "cp8"):
@@ -590,15 +684,20 @@ def run_ai_checkpoints(norm, siem_type, api_key):
 
     for cp_id, ctx in contexts.items():
         try:
-            ai_result = validate_with_ai(cp_id, ctx, api_key)
+            ai_result = validate_with_ai(cp_id, ctx, api_key, provider=provider)
             evidence  = {k: str(v)[:200] for k, v in ctx.items() if k != "parsed"}
             results[cp_id] = {
                 "status":     ai_result["status"] if ai_result else "review",
                 "evidence":   evidence,
                 "assessment": ai_result["assessment"] if ai_result else "No response.",
+                "provider":   provider,
             }
         except Exception as e:
-            results[cp_id] = {"status": "review", "evidence": {}, "assessment": "Error: " + str(e)}
+            results[cp_id] = {
+                "status": "review", "evidence": {},
+                "assessment": "Error: " + str(e),
+                "provider": provider,
+            }
 
     return results
 
@@ -611,7 +710,7 @@ def compute_overall_status(checkpoints):
     return "PASS"
 
 
-def process_all_rows(norm_df, siem_type, api_key, progress_bar, status_text):
+def process_all_rows(norm_df, siem_type, api_key, provider, progress_bar, status_text):
     total = len(norm_df)
     for i in range(total):
         row     = norm_df.iloc[i]
@@ -624,6 +723,7 @@ def process_all_rows(norm_df, siem_type, api_key, progress_bar, status_text):
             "use_case_id":   norm.get("use_case_id", "UC-" + str(i + 1).zfill(3)),
             "use_case_name": uc_name,
             "siem_type":     siem_type,
+            "provider":      provider,
             "checkpoints":   {},
             "overall":       "NEEDS REVIEW",
             "error":         None,
@@ -633,7 +733,7 @@ def process_all_rows(norm_df, siem_type, api_key, progress_bar, status_text):
             result["checkpoints"]["cp1"] = run_cp1(norm, siem_type)
             result["checkpoints"]["cp3"] = run_cp3(norm, siem_type)
             result["checkpoints"]["cp9"] = run_cp9(norm)
-            ai = run_ai_checkpoints(norm, siem_type, api_key)
+            ai = run_ai_checkpoints(norm, siem_type, api_key, provider=provider)
             for cp_key in ("cp2", "cp4", "cp5", "cp6", "cp7", "cp8"):
                 result["checkpoints"][cp_key] = ai.get(
                     cp_key, {"status": "review", "evidence": {}, "assessment": "Not run."})
@@ -706,10 +806,14 @@ def _build_use_case_story(row_data, result, styles, body_style, heading_style, s
 
     story = []
 
+    provider_key   = result.get("provider", "claude")
+    provider_label = AI_PROVIDERS.get(provider_key, AI_PROVIDERS["claude"])["label"]
+
     info_data = [
         ["Use Case Name",  result.get("use_case_name", "N/A")],
         ["Use Case ID",    result.get("use_case_id",   "N/A")],
         ["SIEM Type",      SIEM_LABELS.get(result.get("siem_type", "unknown"), "Unknown")],
+        ["AI Provider",    provider_label],
         ["Overall Result", result.get("overall", "NEEDS REVIEW")],
         ["Validation Date",datetime.now().strftime("%Y-%m-%d")],
     ]
@@ -830,6 +934,12 @@ def generate_consolidated_pdf(results, norm_df):
     pass_c   = sum(1 for r in results.values() if r["overall"] == "PASS")
     fail_c   = sum(1 for r in results.values() if r["overall"] == "FAIL")
     review_c = total - pass_c - fail_c
+
+    # Show provider used
+    providers_used = list({r.get("provider", "claude") for r in results.values()})
+    provider_labels = ", ".join(AI_PROVIDERS.get(p, {}).get("label", p) for p in providers_used)
+    story.append(Paragraph("<b>AI Provider:</b> " + _xml_esc(provider_labels), bs))
+    story.append(Spacer(1, 10))
 
     sum_data = [["Total", "PASS", "FAIL", "NEEDS REVIEW"],
                 [str(total), str(pass_c), str(fail_c), str(review_c)]]
@@ -953,11 +1063,11 @@ def render_upload_page():
     st.markdown("""
     <div class="main-header">
         <h1>SIEM Use Case Validation Agent</h1>
-        <p>Automated batch validation - Splunk, Microsoft Sentinel, Google Chronicle</p>
+        <p>Automated batch validation — Splunk · Microsoft Sentinel · Google Chronicle</p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### Step 1 - Upload your CSV export")
+    st.markdown("### Step 1 — Upload your CSV export")
     uploaded_file = st.file_uploader(
         "Upload a CSV file exported from your SIEM",
         type=["csv"],
@@ -986,7 +1096,7 @@ def render_upload_page():
         detected = detect_siem_type(df)
 
         st.markdown("---")
-        st.markdown("### Step 2 - Confirm SIEM type")
+        st.markdown("### Step 2 — Confirm SIEM type")
 
         siem_options = ["Splunk", "Microsoft Sentinel", "Google Chronicle"]
         siem_keys    = ["splunk", "sentinel", "chronicle"]
@@ -1015,19 +1125,76 @@ def render_upload_page():
             st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.markdown("### Step 3 - Configure AI validation")
-        _secret_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
-        api_key = st.text_input(
-            "Claude API Key",
-            value=_secret_key,
-            type="password",
-            help="Required for AI validation on checkpoints 2, 4, 5, 6, 7, 8."
+        st.markdown("### Step 3 — Choose AI provider & enter API key")
+
+        st.markdown("""
+        <style>
+        .provider-info-box {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 0.9rem 1.1rem;
+            margin-bottom: 0.6rem;
+            font-size: 0.87rem;
+            color: #334155;
+        }
+        .provider-info-box b { color: #0f172a; }
+        .free-tag { color: #166534; font-weight: 600; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="provider-info-box">
+          <b>Available providers for AI checkpoints (CP2, CP4–CP8):</b><br><br>
+          🟣 <b>Claude Sonnet 4.6</b> (Anthropic) — paid, highest accuracy for security tasks<br>
+          🟡 <b>Kimi K2</b> via Groq — <span class="free-tag">free tier</span>, 1T-param MoE, strong agentic reasoning · <a href="https://console.groq.com" target="_blank">get key</a><br>
+          🟡 <b>Llama 3.3 70B</b> via Groq — <span class="free-tag">free tier</span>, fast & reliable for structured tasks · <a href="https://console.groq.com" target="_blank">get key</a>
+        </div>
+        """, unsafe_allow_html=True)
+
+        provider_choice_label = st.selectbox(
+            "AI Provider",
+            options=list(PROVIDER_OPTIONS.keys()),
+            index=0,
+            help="Groq free tier: ~1,000 requests/day. Sign up at console.groq.com for a free API key."
         )
+        provider = PROVIDER_OPTIONS[provider_choice_label]
+        cfg = AI_PROVIDERS[provider]
+
+        # Pre-fill from secrets if available
+        secret_key = ""
+        if hasattr(st, "secrets"):
+            if provider == "claude":
+                secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            else:
+                secret_key = st.secrets.get("GROQ_API_KEY", "")
+
+        api_key = st.text_input(
+            "API Key",
+            value=secret_key,
+            type="password",
+            help=cfg["key_hint"],
+            placeholder=cfg["key_hint"],
+        )
+
         if not api_key:
-            st.info("No API key - checkpoints 2, 4, 5, 6, 7, 8 will be marked NEEDS REVIEW.")
+            if cfg["free"]:
+                st.info(
+                    "No API key — checkpoints 2, 4–8 will be marked NEEDS REVIEW. "
+                    "Get a **free** Groq key at [console.groq.com](https://console.groq.com)."
+                )
+            else:
+                st.info("No API key — checkpoints 2, 4–8 will be marked NEEDS REVIEW.")
+        else:
+            badge_css  = cfg["badge"]
+            badge_text = cfg["badge_text"]
+            st.markdown(
+                f'✅ Key entered — will use <span class="provider-badge {badge_css}">{badge_text}</span> for AI validation.',
+                unsafe_allow_html=True,
+            )
 
         st.markdown("---")
-        st.markdown("### Step 4 - Preview and Run")
+        st.markdown("### Step 4 — Preview and Run")
         st.markdown("**" + str(len(df)) + " use cases** ready to validate.")
         with st.expander("Preview first 5 rows", expanded=False):
             st.dataframe(df.head(), use_container_width=True)
@@ -1038,6 +1205,7 @@ def render_upload_page():
             st.session_state.raw_df          = df
             st.session_state.siem_type       = siem_type
             st.session_state.api_key         = api_key
+            st.session_state.provider        = provider
             st.session_state.results         = {}
             st.session_state.processing_done = False
             st.session_state.page            = "processing"
@@ -1073,12 +1241,15 @@ def render_processing_page():
     norm_df   = st.session_state.normalized_df
     siem_type = st.session_state.siem_type
     api_key   = st.session_state.api_key
+    provider  = st.session_state.get("provider", "claude")
+    cfg       = AI_PROVIDERS.get(provider, AI_PROVIDERS["claude"])
     total     = len(norm_df)
 
     st.markdown("### Processing " + str(total) + " use case" + ("s" if total != 1 else ""))
     st.markdown(
         "SIEM: **" + SIEM_LABELS.get(siem_type, siem_type) + "** | " +
-        "AI validation: **" + ("Enabled" if api_key else "Disabled") + "**"
+        "AI: **" + cfg["label"] + "** | " +
+        "Key: **" + ("Provided" if api_key else "None — manual review mode") + "**"
     )
 
     progress_bar = st.progress(0)
@@ -1090,7 +1261,7 @@ def render_processing_page():
             st.session_state.page = "upload"
             st.rerun()
 
-    process_all_rows(norm_df, siem_type, api_key, progress_bar, status_text)
+    process_all_rows(norm_df, siem_type, api_key, provider, progress_bar, status_text)
 
 
 # =====================================================
@@ -1101,12 +1272,15 @@ def render_results_page():
     st.markdown("""
     <div class="main-header">
         <h1>SIEM Use Case Validation Agent</h1>
-        <p>Validation complete - review results and download reports</p>
+        <p>Validation complete — review results and download reports</p>
     </div>
     """, unsafe_allow_html=True)
 
     results  = st.session_state.results
     norm_df  = st.session_state.normalized_df
+    provider = st.session_state.get("provider", "claude")
+    cfg      = AI_PROVIDERS.get(provider, AI_PROVIDERS["claude"])
+
     total    = len(results)
     pass_c   = sum(1 for r in results.values() if r["overall"] == "PASS")
     fail_c   = sum(1 for r in results.values() if r["overall"] == "FAIL")
@@ -1117,6 +1291,13 @@ def render_results_page():
     c2.metric("PASS",             pass_c)
     c3.metric("FAIL",             fail_c)
     c4.metric("Needs Review",     review_c)
+
+    badge_css  = cfg["badge"]
+    badge_text = cfg["badge_text"]
+    st.markdown(
+        f'AI provider used: <span class="provider-badge {badge_css}">{badge_text}</span> — {cfg["label"]}',
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
     st.markdown("### Validation Summary")
@@ -1202,7 +1383,12 @@ def render_results_page():
                 if res["checkpoints"].get(cp_key, {}).get("assessment")
             ]
             if assessments:
-                st.markdown("**AI Assessments:**")
+                res_provider = res.get("provider", "claude")
+                res_cfg      = AI_PROVIDERS.get(res_provider, AI_PROVIDERS["claude"])
+                st.markdown(
+                    f'**AI Assessments** <span class="provider-badge {res_cfg["badge"]}">{res_cfg["badge_text"]}</span>',
+                    unsafe_allow_html=True,
+                )
                 for cp_key, cp in assessments:
                     a = cp["assessment"].replace("<", "&lt;").replace(">", "&gt;")
                     st.markdown(
@@ -1215,13 +1401,13 @@ def render_results_page():
     st.markdown("---")
     if st.button("Start New Validation", use_container_width=True):
         for k in ["page", "results", "raw_df", "normalized_df",
-                  "processing_done", "siem_type", "api_key"]:
+                  "processing_done", "siem_type", "api_key", "provider"]:
             st.session_state.pop(k, None)
         st.rerun()
 
     st.markdown("""
     <div style="text-align:center;color:#94a3b8;font-size:0.8rem;padding:1rem 0;">
-        SIEM Use Case Validation Agent - AI assessments should be reviewed by a qualified security analyst
+        SIEM Use Case Validation Agent — AI assessments should be reviewed by a qualified security analyst
     </div>
     """, unsafe_allow_html=True)
 
