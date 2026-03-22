@@ -411,13 +411,26 @@ def _call_claude(prompt, api_key, model):
         return result["content"][0]["text"]
 
 
+def _groq_opener():
+    """
+    Return a urllib opener that bypasses any HTTP_PROXY / HTTPS_PROXY env vars.
+    Groq's API is HTTPS-native and direct — proxy tunnelling causes 403s in
+    environments with restrictive egress proxies (e.g. sandboxed CI runners).
+    """
+    import urllib.request
+    # Empty dict = no proxies at all, ignoring env vars
+    proxy_handler = urllib.request.ProxyHandler({})
+    return urllib.request.build_opener(proxy_handler)
+
+
 def _call_groq(prompt, api_key, model):
-    import urllib.request, ssl
+    import urllib.request, ssl, urllib.error
     data = json.dumps({
         "model": model,
         "max_tokens": 1000,
         "messages": [{"role": "user", "content": prompt}]
     }).encode("utf-8")
+
     req = urllib.request.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=data,
@@ -426,10 +439,78 @@ def _call_groq(prompt, api_key, model):
             "Authorization": "Bearer " + api_key,
         }
     )
+
+    opener = _groq_opener()
     ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"]
+
+    try:
+        with opener.open(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            pass
+        if e.code == 401:
+            raise RuntimeError(
+                "Invalid Groq API key (401 Unauthorized). "
+                "Check your key at console.groq.com → API Keys."
+            )
+        elif e.code == 429:
+            raise RuntimeError(
+                "Groq rate limit hit (429). Free tier allows 30 req/min and 1,000 req/day on 70B models. "
+                "Wait a moment and retry, or upgrade at groq.com/pricing."
+            )
+        elif e.code == 400:
+            raise RuntimeError(f"Groq bad request (400): {body[:300]}")
+        else:
+            raise RuntimeError(f"Groq HTTP {e.code}: {e.reason}. {body[:200]}")
+    except urllib.error.URLError as e:
+        reason = str(e.reason)
+        if "403" in reason or "Forbidden" in reason or "Tunnel" in reason:
+            raise RuntimeError(
+                "Cannot reach api.groq.com — your network or egress proxy is blocking this domain. "
+                "This works fine on Streamlit Cloud, local machines, or any environment with open "
+                "outbound HTTPS. Switch to Claude (Anthropic) if you need AI validation in a "
+                "restricted network."
+            )
+        raise RuntimeError(f"Network error reaching Groq: {reason}")
+
+
+def check_groq_reachable():
+    """
+    Quick connectivity probe to api.groq.com (no auth needed).
+    Returns (True, '') or (False, human-readable reason).
+    """
+    import urllib.request, ssl, urllib.error
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": "Bearer probe"},
+    )
+    opener = _groq_opener()
+    ctx = ssl.create_default_context()
+    try:
+        with opener.open(req, timeout=8) as resp:
+            return True, ""
+    except urllib.error.HTTPError as e:
+        # 401 = reached the server, auth failed — that's fine, server IS reachable
+        if e.code == 401:
+            return True, ""
+        return False, f"HTTP {e.code} from Groq"
+    except urllib.error.URLError as e:
+        reason = str(e.reason)
+        if "403" in reason or "Forbidden" in reason or "Tunnel" in reason:
+            return False, (
+                "Your network blocks outbound connections to **api.groq.com**. "
+                "Groq (Kimi K2 / Llama) won't work here. "
+                "Please use **Claude (Anthropic)** instead, or run the app on a machine "
+                "with unrestricted internet access (e.g. Streamlit Community Cloud, local)."
+            )
+        return False, f"Cannot reach api.groq.com: {reason}"
+    except Exception as e:
+        return False, str(e)
 
 
 def validate_with_ai(checkpoint_id, context_data, api_key, provider="claude"):
@@ -448,6 +529,12 @@ def validate_with_ai(checkpoint_id, context_data, api_key, provider="claude"):
             text = _call_groq(prompt, api_key, cfg["model"])
 
         return {"status": _parse_ai_status(text), "assessment": text}
+    except RuntimeError as e:
+        # Re-raised with human-readable messages from _call_groq / _call_claude
+        return {
+            "status": "review",
+            "assessment": f"⚠️ {str(e)}",
+        }
     except Exception as e:
         return {
             "status": "review",
@@ -1177,6 +1264,22 @@ def render_upload_page():
             placeholder=cfg["key_hint"],
         )
 
+        # --- Connectivity check for Groq providers ---
+        groq_blocked = False
+        if provider in ("groq_kimi", "groq_llama"):
+            reachable, block_reason = check_groq_reachable()
+            if not reachable:
+                groq_blocked = True
+                st.error(
+                    "🚫 **Groq unreachable from this environment**\n\n" + block_reason
+                )
+                st.info(
+                    "💡 **What to do:**\n"
+                    "- Switch to **Claude Sonnet 4.6** in the provider dropdown above (works here)\n"
+                    "- Or deploy the app to [Streamlit Community Cloud](https://streamlit.io/cloud) "
+                    "/ run locally where Groq is accessible"
+                )
+
         if not api_key:
             if cfg["free"]:
                 st.info(
@@ -1185,7 +1288,7 @@ def render_upload_page():
                 )
             else:
                 st.info("No API key — checkpoints 2, 4–8 will be marked NEEDS REVIEW.")
-        else:
+        elif not groq_blocked:
             badge_css  = cfg["badge"]
             badge_text = cfg["badge_text"]
             st.markdown(
