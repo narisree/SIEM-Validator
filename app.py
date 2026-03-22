@@ -411,104 +411,116 @@ def _call_claude(prompt, api_key, model):
         return result["content"][0]["text"]
 
 
-def _groq_opener():
-    """
-    Return a urllib opener that bypasses any HTTP_PROXY / HTTPS_PROXY env vars.
-    Groq's API is HTTPS-native and direct — proxy tunnelling causes 403s in
-    environments with restrictive egress proxies (e.g. sandboxed CI runners).
-    """
-    import urllib.request
-    # Empty dict = no proxies at all, ignoring env vars
-    proxy_handler = urllib.request.ProxyHandler({})
-    return urllib.request.build_opener(proxy_handler)
+# Browser-like UA to avoid Cloudflare bot detection (error 1010)
+_GROQ_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
 
 
 def _call_groq(prompt, api_key, model):
-    import urllib.request, ssl, urllib.error
-    data = json.dumps({
+    """
+    Call Groq's OpenAI-compatible endpoint via 'requests' library.
+    - requests is bundled with streamlit, so always available
+    - bypasses env proxy vars (proxies={}) to avoid tunnel 403s
+    - sends browser User-Agent to avoid Cloudflare 1010 bot blocks
+    """
+    import requests
+
+    headers = {**_GROQ_HEADERS, "Authorization": "Bearer " + api_key}
+    payload = {
         "model": model,
         "max_tokens": 1000,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + api_key,
-        }
-    )
-
-    opener = _groq_opener()
-    ctx = ssl.create_default_context()
+        "messages": [{"role": "user", "content": prompt}],
+    }
 
     try:
-        with opener.open(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"]
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8")
-        except Exception:
-            pass
-        if e.code == 401:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30,
+            proxies={},   # bypass any env HTTP_PROXY / HTTPS_PROXY
+        )
+    except requests.exceptions.ConnectionError as e:
+        err = str(e)
+        if "403" in err or "Forbidden" in err or "tunnel" in err.lower():
             raise RuntimeError(
-                "Invalid Groq API key (401 Unauthorized). "
-                "Check your key at console.groq.com → API Keys."
+                "Cannot reach api.groq.com — your network or egress proxy blocks this domain. "
+                "Switch to **Claude (Anthropic)** or run the app locally / on Streamlit Cloud."
             )
-        elif e.code == 429:
+        raise RuntimeError(f"Network error reaching Groq: {err[:200]}")
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Groq request timed out after 30 s. Try again or switch to Claude.")
+
+    if resp.status_code == 200:
+        return resp.json()["choices"][0]["message"]["content"]
+    elif resp.status_code == 401:
+        raise RuntimeError(
+            "Invalid Groq API key (401). Check your key at console.groq.com → API Keys."
+        )
+    elif resp.status_code == 429:
+        raise RuntimeError(
+            "Groq rate limit hit (429). Free tier: 30 req/min, 1,000 req/day on 70B models. "
+            "Wait a moment and retry, or upgrade at groq.com/pricing."
+        )
+    elif resp.status_code == 403:
+        body = resp.text[:300]
+        if "1010" in body or "cloudflare" in body.lower() or "bot" in body.lower():
             raise RuntimeError(
-                "Groq rate limit hit (429). Free tier allows 30 req/min and 1,000 req/day on 70B models. "
-                "Wait a moment and retry, or upgrade at groq.com/pricing."
+                "Cloudflare is blocking the request to Groq (error 1010 — bot detection). "
+                "This usually means the server environment is flagged. "
+                "Try running the app locally or on Streamlit Community Cloud where outbound "
+                "requests appear as regular browser traffic."
             )
-        elif e.code == 400:
-            raise RuntimeError(f"Groq bad request (400): {body[:300]}")
-        else:
-            raise RuntimeError(f"Groq HTTP {e.code}: {e.reason}. {body[:200]}")
-    except urllib.error.URLError as e:
-        reason = str(e.reason)
-        if "403" in reason or "Forbidden" in reason or "Tunnel" in reason:
-            raise RuntimeError(
-                "Cannot reach api.groq.com — your network or egress proxy is blocking this domain. "
-                "This works fine on Streamlit Cloud, local machines, or any environment with open "
-                "outbound HTTPS. Switch to Claude (Anthropic) if you need AI validation in a "
-                "restricted network."
-            )
-        raise RuntimeError(f"Network error reaching Groq: {reason}")
+        raise RuntimeError(f"Groq 403 Forbidden: {body}")
+    else:
+        raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:300]}")
 
 
 def check_groq_reachable():
     """
-    Quick connectivity probe to api.groq.com (no auth needed).
+    Quick connectivity probe to api.groq.com.
     Returns (True, '') or (False, human-readable reason).
+    Uses requests + proxies={} + browser UA — same stack as _call_groq.
     """
-    import urllib.request, ssl, urllib.error
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/models",
-        headers={"Authorization": "Bearer probe"},
-    )
-    opener = _groq_opener()
-    ctx = ssl.create_default_context()
+    import requests
+
+    headers = {**_GROQ_HEADERS, "Authorization": "Bearer probe"}
     try:
-        with opener.open(req, timeout=8) as resp:
+        resp = requests.get(
+            "https://api.groq.com/openai/v1/models",
+            headers=headers,
+            timeout=8,
+            proxies={},
+        )
+        # 401 = server reachable, just bad key (expected for probe)
+        if resp.status_code in (200, 401):
             return True, ""
-    except urllib.error.HTTPError as e:
-        # 401 = reached the server, auth failed — that's fine, server IS reachable
-        if e.code == 401:
-            return True, ""
-        return False, f"HTTP {e.code} from Groq"
-    except urllib.error.URLError as e:
-        reason = str(e.reason)
-        if "403" in reason or "Forbidden" in reason or "Tunnel" in reason:
+        elif resp.status_code == 403:
+            body = resp.text[:300]
+            if "1010" in body or "cloudflare" in body.lower():
+                return False, (
+                    "Cloudflare is blocking requests to api.groq.com from this environment "
+                    "(error 1010 — bot/datacenter IP detection). "
+                    "Groq works fine on **local machines** and **Streamlit Community Cloud**. "
+                    "For now, please use **Claude (Anthropic)** as your AI provider."
+                )
+            return False, f"Groq returned 403: {body}"
+        else:
+            return False, f"Unexpected response from Groq: HTTP {resp.status_code}"
+    except requests.exceptions.ConnectionError as e:
+        err = str(e)
+        if "403" in err or "Forbidden" in err or "tunnel" in err.lower():
             return False, (
-                "Your network blocks outbound connections to **api.groq.com**. "
-                "Groq (Kimi K2 / Llama) won't work here. "
-                "Please use **Claude (Anthropic)** instead, or run the app on a machine "
-                "with unrestricted internet access (e.g. Streamlit Community Cloud, local)."
+                "Your network's egress proxy is blocking api.groq.com. "
+                "Please use **Claude (Anthropic)** instead."
             )
-        return False, f"Cannot reach api.groq.com: {reason}"
+        return False, f"Cannot reach api.groq.com: {err[:200]}"
     except Exception as e:
         return False, str(e)
 
