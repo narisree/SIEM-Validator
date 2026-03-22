@@ -224,6 +224,8 @@ def init_session_state():
         "normalized_df":    None,
         "processing_done":  False,
         "results":          {},
+        "yaral_lookup":     {},   # {rule_name: rule_text} from ZIP upload (Chronicle only)
+        "yaral_unmatched":  [],   # rule names in ZIP with no CSV row match
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -572,7 +574,7 @@ def detect_siem_type(df):
     return best if scores[best] >= 2 else "unknown"
 
 
-def normalize_row(row, siem_type, df_columns):
+def normalize_row(row, siem_type, df_columns, yaral_lookup=None):
     col_map    = COLUMN_MAPS.get(siem_type, COLUMN_MAPS["splunk"])
     cols_lower = {c.lower().strip(): c for c in df_columns}
     norm = {}
@@ -590,8 +592,355 @@ def normalize_row(row, siem_type, df_columns):
     if not norm.get("use_case_name"):
         norm["use_case_name"] = f"Use Case {int(row.name) + 1}"
     norm["siem_type"] = siem_type
+
+    # Chronicle: if a YARAL ZIP was uploaded, replace query with structured rule text
+    if siem_type == "chronicle" and yaral_lookup:
+        yaral_text = _match_yaral(norm["use_case_name"], yaral_lookup)
+        if yaral_text:
+            norm["query"]        = yaral_text
+            norm["query_source"] = "yaral_zip"
+        else:
+            norm["query_source"] = "csv"
+    else:
+        norm["query_source"] = "csv"
+
     return norm
 
+
+
+# =====================================================
+# HELPER: YARA-L PARSING (Chronicle only)
+# =====================================================
+
+# Regex patterns — all use DOTALL+IGNORECASE so they work on both
+# properly-newlined rule text AND single-line collapsed CSV exports.
+_YL_META_BLOCK      = re.compile(r'meta\s*:\s*(.*?)(?=events\s*:|match\s*:|condition\s*:|outcome\s*:|\})',      re.DOTALL | re.IGNORECASE)
+_YL_EVENTS_BLOCK    = re.compile(r'events\s*:\s*(.*?)(?=match\s*:|condition\s*:|outcome\s*:|\})',               re.DOTALL | re.IGNORECASE)
+_YL_MATCH_BLOCK     = re.compile(r'match\s*:\s*(.*?)(?=condition\s*:|outcome\s*:|\})',                          re.DOTALL | re.IGNORECASE)
+_YL_OUTCOME_BLOCK   = re.compile(r'outcome\s*:\s*(.*?)(?=condition\s*:|\})',                                    re.DOTALL | re.IGNORECASE)
+_YL_CONDITION_BLOCK = re.compile(r'condition\s*:\s*(.*?)(?=\}|$)',                                              re.DOTALL | re.IGNORECASE)
+
+_YL_SEVERITY   = re.compile(r'severity\s*=\s*["\']([^"\']+)["\']',    re.IGNORECASE)
+_YL_RUN_FREQ   = re.compile(r'run_frequency\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+_YL_MATCH_OVER = re.compile(r'(\$[\w]+(?:\s*,\s*\$[\w]+)*)\s+over\s+(\d+\s*[mhd])', re.IGNORECASE)
+_YL_COUNT_EXPR = re.compile(r'#(\w+)\s*([><=!]+)\s*(\d+)')
+_YL_STAT_EXPR  = re.compile(r'math\.(\w+)\s*\((.+?)\)\s*([><=!]+)\s*([\d.]+)', re.IGNORECASE | re.DOTALL)
+_YL_EVENT_TYPE = re.compile(r'metadata\.event_type\s*=\s*["\']([A-Z_]+)["\']')
+_YL_EVT_FILTER = re.compile(r'(length|re\.regex|net\.ip_in_range_cidr)\s*\(', re.IGNORECASE)
+_YL_RISK_SCORE = re.compile(r'\$risk_score\s*=\s*(\d+)')
+
+VALID_RUN_FREQS   = {"live", "hourly", "daily", "weekly"}
+NORMALISE_TIME    = {"60m": "1h", "1440m": "24h", "120m": "2h",
+                     "180m": "3h", "240m": "4h", "360m": "6h", "720m": "12h"}
+
+
+def _norm_time(t):
+    """Normalise time strings — strip spaces, lowercase, apply known aliases."""
+    t = t.replace(" ", "").lower()
+    return NORMALISE_TIME.get(t, t)
+
+
+def parse_yara_l(rule_text):
+    """
+    Parse a YARA-L 2.0 rule (newlined or collapsed) and return a structured dict.
+    Never raises — missing fields return empty string or empty list.
+    """
+    out = {
+        "severity":               "",
+        "run_frequency":          "",
+        "match_window":           "",
+        "grouping_fields":        "",
+        "count_thresholds":       [],
+        "statistical_conditions": [],
+        "event_filters":          [],
+        "event_types":            [],
+        "risk_score":             "",
+        "rule_mode":              "",
+        "parse_source":           "rule_text",
+    }
+
+    if not rule_text or not rule_text.strip():
+        return out
+
+    # ── Extract blocks ──────────────────────────────────────────
+    def _block(pattern, text):
+        m = pattern.search(text)
+        return m.group(1).strip() if m else ""
+
+    meta_blk      = _block(_YL_META_BLOCK,      rule_text)
+    events_blk    = _block(_YL_EVENTS_BLOCK,     rule_text)
+    match_blk     = _block(_YL_MATCH_BLOCK,      rule_text)
+    outcome_blk   = _block(_YL_OUTCOME_BLOCK,    rule_text)
+    condition_blk = _block(_YL_CONDITION_BLOCK,  rule_text)
+
+    # ── Severity (meta block) ────────────────────────────────────
+    m = _YL_SEVERITY.search(meta_blk)
+    if m:
+        out["severity"] = m.group(1).strip().upper()
+
+    # ── Run frequency (meta block) ───────────────────────────────
+    m = _YL_RUN_FREQ.search(meta_blk)
+    if m:
+        out["run_frequency"] = m.group(1).strip().upper()
+
+    # ── Match window + grouping fields ───────────────────────────
+    m = _YL_MATCH_OVER.search(match_blk)
+    if m:
+        raw_vars = m.group(1)
+        out["grouping_fields"] = ", ".join(
+            v.strip() for v in raw_vars.split(",") if v.strip()
+        )
+        out["match_window"] = _norm_time(m.group(2))
+
+    # ── Count thresholds (condition block — #var only) ───────────
+    for m in _YL_COUNT_EXPR.finditer(condition_blk):
+        var, op, val = m.group(1), m.group(2), m.group(3)
+        label = f"#{var} {op} {val}"
+        if op in (">=", ">") and int(val) <= 1:
+            label += " (any match)"
+        out["count_thresholds"].append(label)
+
+    # ── Statistical / function conditions ────────────────────────
+    for m in _YL_STAT_EXPR.finditer(condition_blk):
+        # group(1)=func_name, group(2)=inner_args (ignored), group(3)=op, group(4)=val
+        out["statistical_conditions"].append(
+            f"math.{m.group(1)}(...) {m.group(3)} {m.group(4)}"
+        )
+
+    # ── Event filter functions (events block) ────────────────────
+    for m in _YL_EVT_FILTER.finditer(events_blk):
+        out["event_filters"].append(m.group(1).lower())
+
+    # ── Event types ──────────────────────────────────────────────
+    out["event_types"] = list(dict.fromkeys(
+        m.group(1) for m in _YL_EVENT_TYPE.finditer(events_blk)
+    ))
+
+    # ── Risk score (outcome block) ───────────────────────────────
+    m = _YL_RISK_SCORE.search(outcome_blk)
+    if m:
+        out["risk_score"] = m.group(1)
+
+    # ── Rule mode ────────────────────────────────────────────────
+    rf = out["run_frequency"].lower()
+    out["rule_mode"] = "SCHEDULED" if rf in {"hourly", "daily", "weekly"} else "LIVE"
+
+    return out
+
+
+# =====================================================
+# HELPER: YARAL ZIP HANDLER (Chronicle only)
+# =====================================================
+
+def parse_yaral_zip(zip_bytes):
+    """
+    Extract .yaral files from a ZIP bytes object.
+    Returns:
+        lookup   : {normalised_rule_name: rule_text}
+        warnings : [str]  — files that were skipped and why
+    """
+    lookup   = {}
+    warnings = []
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile:
+        return {}, ["Uploaded file is not a valid ZIP archive."]
+
+    yaral_entries = [n for n in zf.namelist() if n.lower().endswith(".yaral")]
+
+    if not yaral_entries:
+        return {}, ["ZIP contains no .yaral files. Make sure you exported from Chronicle Detection Engine → Export All Rules."]
+
+    for entry in yaral_entries:
+        try:
+            raw = zf.read(entry).decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            warnings.append(f"{entry}: could not read — {e}")
+            continue
+
+        # Basic structure validation
+        if "events" not in raw.lower() or "condition" not in raw.lower():
+            warnings.append(f"{entry}: skipped — does not look like a valid YARA-L rule (missing events/condition blocks).")
+            continue
+
+        # Extract rule name from rule text first, fall back to filename
+        name_match = re.search(r'rule\s+(\w+)\s*\{', raw)
+        if name_match:
+            rule_name = name_match.group(1).strip()
+        else:
+            rule_name = entry.split("/")[-1].replace(".yaral", "").strip()
+            warnings.append(f"{entry}: could not parse rule name from content, using filename '{rule_name}'.")
+
+        key = rule_name.lower().strip()
+        if key in lookup:
+            warnings.append(f"{entry}: duplicate rule name '{rule_name}' — keeping first occurrence.")
+            continue
+
+        lookup[key] = raw
+
+    return lookup, warnings
+
+
+def _match_yaral(use_case_name, yaral_lookup):
+    """
+    Case-insensitive lookup of use_case_name in yaral_lookup.
+    Returns rule_text string or None.
+    """
+    if not yaral_lookup:
+        return None
+    key = use_case_name.lower().strip()
+    # Exact match first
+    if key in yaral_lookup:
+        return yaral_lookup[key]
+    # Partial match fallback — rule name contained in use_case_name or vice versa
+    for k, v in yaral_lookup.items():
+        if k in key or key in k:
+            return v
+    return None
+
+
+# =====================================================
+# CHRONICLE CP3 — DEDICATED SCORER
+# =====================================================
+
+def run_cp3_chronicle(norm):
+    """
+    Chronicle-specific CP3 scorer.
+    Source priority: CSV columns first, YARA-L rule_text second.
+    Returns same dict shape as run_cp3() so downstream code is unaffected.
+    """
+    rule_text    = norm.get("query", "")
+    parsed       = parse_yara_l(rule_text)
+    notes        = []
+    score        = 0
+    source_flags = []   # tracks where each field came from
+
+    # ── Point 1: Severity ────────────────────────────────────────
+    # CSV column takes priority
+    sev_csv  = norm.get("severity", "").strip().upper()
+    sev_rule = parsed["severity"]
+    sev_valid = {s.upper() for s in VALID_SEVERITIES}
+
+    if sev_csv and sev_csv in sev_valid:
+        score += 1
+        notes.append(f"Severity '{sev_csv}' (CSV column)")
+        source_flags.append("severity: csv")
+        sev_final = sev_csv
+    elif sev_rule and sev_rule in sev_valid:
+        score += 1
+        notes.append(f"Severity '{sev_rule}' (meta block)")
+        source_flags.append("severity: rule_text")
+        sev_final = sev_rule
+    elif sev_csv or sev_rule:
+        val = sev_csv or sev_rule
+        notes.append(f"Severity '{val}' not a recognised value")
+        source_flags.append("severity: unrecognised")
+        sev_final = val
+    else:
+        notes.append("Severity: not found in CSV column or meta block")
+        source_flags.append("severity: missing")
+        sev_final = ""
+
+    # ── Point 2: Run Frequency ───────────────────────────────────
+    freq_csv  = norm.get("frequency", "").strip()
+    freq_rule = parsed["run_frequency"]
+
+    if freq_csv:
+        score += 1
+        notes.append(f"Run frequency: {freq_csv} (CSV column)")
+        source_flags.append("frequency: csv")
+        freq_final = freq_csv
+    elif freq_rule and freq_rule.lower() in VALID_RUN_FREQS:
+        score += 1
+        notes.append(f"Run frequency: {freq_rule} (meta block)")
+        source_flags.append("frequency: rule_text")
+        freq_final = freq_rule
+    else:
+        # Infer LIVE — valid YARA-L without run_frequency defaults to LIVE streaming
+        score += 1
+        notes.append("Run frequency: LIVE (inferred — no run_frequency in meta block; Chronicle default)")
+        source_flags.append("frequency: inferred_live")
+        freq_final = "LIVE (inferred)"
+
+    # ── Point 3: Match Window / Lookback ─────────────────────────
+    lookback_csv  = norm.get("lookback", "").strip()
+    match_window  = parsed["match_window"]
+    grouping      = parsed["grouping_fields"]
+
+    if match_window:
+        score += 1
+        grp_note = f", grouping: {grouping}" if grouping else ""
+        notes.append(f"Match window: {match_window}{grp_note} (match clause)")
+        source_flags.append("lookback: rule_text")
+        window_final = match_window
+    elif lookback_csv:
+        score += 1
+        notes.append(f"Lookback: {lookback_csv} (CSV column — match clause not parsed)")
+        source_flags.append("lookback: csv")
+        window_final = lookback_csv
+    else:
+        notes.append("Match window / lookback: not found in match clause or CSV column")
+        source_flags.append("lookback: missing")
+        window_final = ""
+
+    # ── Point 4: Threshold ───────────────────────────────────────
+    count_thresholds = parsed["count_thresholds"]
+    stat_conditions  = parsed["statistical_conditions"]
+
+    if count_thresholds:
+        score += 1
+        notes.append(f"Count threshold: {', '.join(count_thresholds)} (condition block)")
+        source_flags.append("threshold: rule_text")
+    else:
+        # Check if condition block has simple boolean ($event) — any match = threshold of 1
+        rule_lower = rule_text.lower()
+        has_condition = "condition" in rule_lower
+        if has_condition and not count_thresholds:
+            # Look for simple variable reference without count
+            simple_match = re.search(r'condition\s*:\s*\$\w+\s*(?:and|or|$)', rule_text, re.IGNORECASE)
+            if simple_match:
+                score += 1
+                notes.append("Threshold: any match / single event (simple boolean condition)")
+                source_flags.append("threshold: any_match")
+                count_thresholds = ["any match (1)"]
+            else:
+                notes.append("Threshold: condition block present but no #variable count expression found")
+                source_flags.append("threshold: unparseable")
+        else:
+            notes.append("Threshold: no condition block found")
+            source_flags.append("threshold: missing")
+
+    # ── Status ───────────────────────────────────────────────────
+    status = "pass" if score >= 4 else "review" if score >= 2 else "fail"
+
+    # ── Assessment string ─────────────────────────────────────────
+    assessment = (
+        f"Score {score}/4 (Chronicle). " + "; ".join(notes) + "."
+    )
+    if stat_conditions:
+        assessment += f" Statistical conditions also found: {', '.join(stat_conditions)}."
+    if parsed["event_filters"]:
+        assessment += f" Event filter functions in rule: {', '.join(parsed['event_filters'])}."
+
+    # ── Evidence dict ─────────────────────────────────────────────
+    evidence = {
+        "severity":               sev_final,
+        "run_frequency":          freq_final,
+        "match_window":           window_final,
+        "grouping_fields":        grouping or norm.get("grouping_fields", ""),
+        "count_threshold":        ", ".join(count_thresholds) if count_thresholds else "none",
+        "statistical_conditions": ", ".join(stat_conditions) if stat_conditions else "none",
+        "event_types":            ", ".join(parsed["event_types"]) if parsed["event_types"] else "none",
+        "event_filters":          ", ".join(parsed["event_filters"]) if parsed["event_filters"] else "none",
+        "rule_mode":              parsed["rule_mode"],
+        "score":                  f"{score}/4",
+        "parsed_from":            " + ".join(dict.fromkeys(
+                                      f.split(":")[1].strip() for f in source_flags
+                                  )),
+    }
+
+    return {"status": status, "evidence": evidence, "assessment": assessment}
 
 # =====================================================
 # CHECKPOINT RUNNERS
@@ -633,6 +982,10 @@ def run_cp1(norm, siem_type):
 
 
 def run_cp3(norm, siem_type):
+    # Chronicle gets its own dedicated scorer — Splunk/Sentinel paths unchanged below
+    if siem_type == "chronicle":
+        return run_cp3_chronicle(norm)
+
     score = 0
     notes = []
 
@@ -809,11 +1162,11 @@ def compute_overall_status(checkpoints):
     return "PASS"
 
 
-def process_all_rows(norm_df, siem_type, api_key, provider, progress_bar, status_text):
+def process_all_rows(norm_df, siem_type, api_key, provider, progress_bar, status_text, yaral_lookup=None):
     total = len(norm_df)
     for i in range(total):
         row     = norm_df.iloc[i]
-        norm    = dict(row)
+        norm    = dict(row)  # already normalized via normalize_row in upload step
         uc_name = norm.get("use_case_name", "Row " + str(i + 1))
         status_text.markdown("**Processing " + str(i + 1) + "/" + str(total) + ":** " + uc_name)
         progress_bar.progress(i / total)
@@ -1223,6 +1576,52 @@ def render_upload_page():
         with st.expander("Column mapping preview", expanded=False):
             st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
 
+        # ── Chronicle-only: YARAL ZIP uploader ────────────────
+        if siem_type == "chronicle":
+            st.markdown("---")
+            st.markdown("### Step 2b — Upload Chronicle Rules ZIP *(optional but recommended)*")
+            st.markdown("""
+<div class="provider-info-box">
+  <b>Why upload a ZIP?</b><br>
+  Chronicle CSV exports often collapse YARA-L rule text onto a single line, which limits how
+  accurately CP3 can parse thresholds, match windows, and event types.<br><br>
+  The ZIP export preserves the full structured rule text, giving you higher-quality CP3 results.<br><br>
+  <b>How to export:</b> Chronicle UI → Detection Engine → <i>select rules</i> → Export → Download as ZIP
+</div>
+""", unsafe_allow_html=True)
+
+            yaral_zip_file = st.file_uploader(
+                "Upload Chronicle rules ZIP (.zip of .yaral files)",
+                type=["zip"],
+                key="yaral_zip_uploader",
+                help="Optional. If provided, rule text from .yaral files overrides the CSV rule_text column for CP3 parsing."
+            )
+
+            if yaral_zip_file is not None:
+                zip_bytes = yaral_zip_file.read()
+                # Preview ZIP contents inline without storing to session yet
+                try:
+                    import zipfile as _zf, io as _io
+                    _preview = _zf.ZipFile(_io.BytesIO(zip_bytes))
+                    yaral_count = sum(1 for n in _preview.namelist() if n.lower().endswith(".yaral"))
+                    total_files = len(_preview.namelist())
+                    if yaral_count == 0:
+                        st.error("ZIP contains no .yaral files. Please export from Chronicle Detection Engine → Export All Rules.")
+                        zip_bytes = None
+                    else:
+                        st.success(f"✅ ZIP contains **{yaral_count} .yaral file(s)** ({total_files} total files). Will be matched to CSV rows by rule name.")
+                        with st.expander("Preview .yaral files in ZIP", expanded=False):
+                            for name in _preview.namelist():
+                                if name.lower().endswith(".yaral"):
+                                    st.markdown(f"- `{name}`")
+                except Exception as e:
+                    st.error(f"Could not read ZIP: {e}")
+                    zip_bytes = None
+                st.session_state["_pending_zip_bytes"] = zip_bytes
+            else:
+                st.session_state["_pending_zip_bytes"] = None
+                st.caption("No ZIP uploaded — CP3 will parse rule text from the CSV `rule_text` column directly.")
+
         st.markdown("---")
         st.markdown("### Step 3 — Choose AI provider & enter API key")
 
@@ -1315,7 +1714,35 @@ def render_upload_page():
             st.dataframe(df.head(), use_container_width=True)
 
         if st.button("Run Validation", type="primary", use_container_width=True):
-            norm_rows = [normalize_row(df.iloc[i], siem_type, list(df.columns)) for i in range(len(df))]
+            # Parse YARAL ZIP if one was uploaded (Chronicle only)
+            yaral_lookup    = {}
+            yaral_unmatched = []
+            if siem_type == "chronicle":
+                pending_zip = st.session_state.get("_pending_zip_bytes")
+                if pending_zip:
+                    with st.spinner("Parsing YARAL ZIP..."):
+                        yaral_lookup, zip_warnings = parse_yaral_zip(pending_zip)
+                    if zip_warnings:
+                        for w in zip_warnings:
+                            st.warning(f"ZIP: {w}")
+                    # Find ZIP rules with no matching CSV row
+                    csv_names = {
+                        str(df.iloc[i].get(
+                            next((c for c in ["rule_name","name","displayName","title"]
+                                  if c in df.columns), df.columns[0]),
+                            ""
+                        )).lower().strip()
+                        for i in range(len(df))
+                    }
+                    yaral_unmatched = [
+                        k for k in yaral_lookup
+                        if not any(k in cn or cn in k for cn in csv_names if cn)
+                    ]
+
+            norm_rows = [
+                normalize_row(df.iloc[i], siem_type, list(df.columns), yaral_lookup=yaral_lookup)
+                for i in range(len(df))
+            ]
             st.session_state.normalized_df   = pd.DataFrame(norm_rows)
             st.session_state.raw_df          = df
             st.session_state.siem_type       = siem_type
@@ -1323,6 +1750,8 @@ def render_upload_page():
             st.session_state.provider        = provider
             st.session_state.results         = {}
             st.session_state.processing_done = False
+            st.session_state.yaral_lookup    = yaral_lookup
+            st.session_state.yaral_unmatched = yaral_unmatched
             st.session_state.page            = "processing"
             st.rerun()
 
@@ -1406,6 +1835,25 @@ def render_results_page():
     c2.metric("PASS",             pass_c)
     c3.metric("FAIL",             fail_c)
     c4.metric("Needs Review",     review_c)
+
+    # ── Chronicle: warn about ZIP rules with no CSV match ────────
+    yaral_unmatched = st.session_state.get("yaral_unmatched", [])
+    if yaral_unmatched:
+        with st.expander(
+            f"⚠️ {len(yaral_unmatched)} rule(s) from the YARAL ZIP had no matching CSV row — click to view",
+            expanded=True
+        ):
+            st.markdown(
+                "These rules were found in the uploaded ZIP but could not be matched to any row "
+                "in the CSV by rule name. They were **not validated**. "
+                "Check for name mismatches between your ZIP export and CSV export."
+            )
+            for name in sorted(yaral_unmatched):
+                st.markdown(f"- `{name}`")
+            st.markdown(
+                "_Tip: Rule names are matched case-insensitively. "
+                "Make sure the CSV `rule_name` column matches the `rule NAME {` identifier in the .yaral file._"
+            )
 
     badge_css  = cfg["badge"]
     badge_text = cfg["badge_text"]
@@ -1516,7 +1964,8 @@ def render_results_page():
     st.markdown("---")
     if st.button("Start New Validation", use_container_width=True):
         for k in ["page", "results", "raw_df", "normalized_df",
-                  "processing_done", "siem_type", "api_key", "provider"]:
+                  "processing_done", "siem_type", "api_key", "provider",
+                  "yaral_lookup", "yaral_unmatched", "_pending_zip_bytes"]:
             st.session_state.pop(k, None)
         st.rerun()
 
